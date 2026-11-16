@@ -1,8 +1,9 @@
 name: Мониторинг инвертора
 
+# Непрерывный режим: запуск работает около 25 минут, проверяет инвертор каждые 2 минуты
+# и в конце сам запускает следующий. Расписанию GitHub доверять нельзя (задержки до часа),
+# поэтому оно используется только в watchdog.yml как страховка.
 on:
-  schedule:
-    - cron: "*/5 * * * *"   # GitHub запускает по расписанию с задержками, реальный шаг 5–15 минут
   workflow_dispatch:
     inputs:
       send_status:
@@ -12,9 +13,9 @@ on:
 
 permissions:
   contents: write   # keepalive-коммит
-  actions: write    # удаление старых кэшей с состоянием
+  actions: write    # запуск следующего звена, удаление старых кэшей
 
-# Запуски идут строго по очереди и не отменяют друг друга: состояние общее.
+# Одновременно работает только один запуск: состояние общее.
 concurrency:
   group: inverter-monitor
   cancel-in-progress: false
@@ -22,7 +23,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -44,7 +45,8 @@ jobs:
           restore-keys: |
             inverter-state-
 
-      - name: Проверить инвертор
+      - name: Проверять инвертор
+        id: check
         env:
           LUX_ACCOUNT: ${{ secrets.LUX_ACCOUNT }}
           LUX_PASSWORD: ${{ secrets.LUX_PASSWORD }}
@@ -53,12 +55,13 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SITE_NAME: ${{ vars.SITE_NAME }}
           SEND_STATUS: ${{ inputs.send_status }}
+          PORTAL_FAIL_ALERT: "8"   # 8 проверок по 2 минуты = около 15 минут без портала
         run: |
+          args="--loop 25 --interval 120"
           if [ "$SEND_STATUS" = "true" ]; then
-            python monitor.py --status
-          else
-            python monitor.py
+            args="$args --status"
           fi
+          python -u monitor.py $args
 
       - name: Сохранить состояние
         if: always() && hashFiles('state.json') != ''
@@ -80,7 +83,6 @@ jobs:
 
       - name: Keepalive
         # GitHub отключает расписание в публичных репозиториях без активности 60 дней
-        if: github.event_name == 'schedule'
         continue-on-error: true
         run: |
           days=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
@@ -91,3 +93,9 @@ jobs:
             git commit --allow-empty -m "keepalive: расписание остаётся активным"
             git push
           fi
+
+      - name: Запустить следующее звено
+        # Только после успешной проверки: при ошибке настройки цепочка не должна крутиться вхолостую,
+        # её перезапустит watchdog.
+        if: always() && steps.check.outcome == 'success'
+        run: gh workflow run monitor.yml --ref "${{ github.ref_name }}" -f send_status=false

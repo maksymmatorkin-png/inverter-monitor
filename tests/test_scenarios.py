@@ -61,7 +61,8 @@ class Home:
     def __init__(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="inverter-test-"))
 
-    def run(self, now: str, *, portal_down: bool = False, status: bool = False, **snap) -> list[str]:
+    def run(self, now: str, *, portal_down: bool = False, status: bool = False,
+            extra: tuple[str, ...] = (), **snap) -> list[str]:
         fixture = self.dir / "fixture.json"
         if portal_down:
             fixture = self.dir / "missing.json"
@@ -70,16 +71,16 @@ class Home:
         cmd = [sys.executable, str(ROOT / "monitor.py"), "--dry-run", "--fixture", str(fixture), "--now", now]
         if status:
             cmd.append("--status")
+        cmd += extra
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("LUX_", "TG_")) and k not in ("SOC_ALERTS", "SUMMARY_HOUR", "TIMEZONE")}
         env["STATE_FILE"] = str(self.dir / "state.json")
         env["PYTHONIOENCODING"] = "utf-8"
         p = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf-8")
         assert p.returncode == 0, f"код {p.returncode}\n{p.stdout}\n{p.stderr}"
-        msgs = p.stdout.split("----\n")[1:]
-        if msgs:  # отрезаем строку «OK: ...» после последнего сообщения
-            msgs[-1] = msgs[-1].split("\nOK: ")[0]
-        return [m.strip() for m in msgs]
+        self.checks = p.stdout.count("OK: grid=")
+        # отрезаем строки «OK: ...» после сообщений
+        return [m.split("\nOK: ")[0].strip() for m in p.stdout.split("----\n")[1:]]
 
 
 def expect(msgs: list[str], *needles: str, count: int | None = None) -> None:
@@ -197,6 +198,15 @@ def test_first_run_in_the_evening() -> None:
     m = h.run(T("22:00"), status=True)
     expect(m, "Мониторинг инвертора запущен", count=1)                   # без сводки и без дубля статуса
     assert "Итоги дня" not in m[0]
+
+
+def test_loop_mode() -> None:
+    h = Home()
+    h.run(T("10:00"))
+    # ~3 секунды, проверка каждую секунду: событие и статус приходят один раз, а не на каждой проверке
+    m = h.run(T("10:05"), grid=False, status=True, extra=("--loop", "0.05", "--interval", "1"))
+    assert h.checks >= 3, f"проверок в цикле: {h.checks}"
+    expect(m, "Свет пропал", "текущий статус", count=2)
 
 
 if __name__ == "__main__":

@@ -80,6 +80,7 @@ class LuxPortal:
         self.base, self.account, self.password, self.serial = base, account, password, serial
         self.s = requests.Session()
         self.s.headers["User-Agent"] = "Mozilla/5.0 (inverter-monitor)"
+        self.logged_in = False
 
     def login(self) -> None:
         r = self.s.post(
@@ -106,7 +107,17 @@ class LuxPortal:
         return j
 
     def fetch(self) -> dict:
+        """Читает данные; сессию переиспользует, при сбое входит заново и повторяет один раз."""
+        if self.logged_in:
+            try:
+                return self._fetch_all()
+            except (PortalError, requests.RequestException):
+                self.logged_in = False  # сессия могла истечь
         self.login()
+        self.logged_in = True
+        return self._fetch_all()
+
+    def _fetch_all(self) -> dict:
         return {
             "runtime": self._api("inverter/getInverterRuntime"),
             "battery": self._api("battery/getBatteryInfo"),
@@ -426,6 +437,9 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="печатать сообщения вместо отправки")
     ap.add_argument("--fixture", help="JSON с ответами портала вместо реального запроса (для тестов)")
     ap.add_argument("--now", help="подменить текущее время, ISO 8601 с часовым поясом (для тестов)")
+    ap.add_argument("--loop", type=float, default=0, metavar="МИНУТ",
+                    help="работать столько минут, проверяя инвертор каждые --interval секунд")
+    ap.add_argument("--interval", type=float, default=120, metavar="СЕКУНД", help="пауза между проверками в цикле")
     args = ap.parse_args()
 
     for stream in (sys.stdout, sys.stderr):
@@ -444,40 +458,53 @@ def main() -> int:
     except ValueError:
         print("state.json повреждён, начинаю с чистого состояния", file=sys.stderr)
         st = {}
-    now = datetime.fromisoformat(args.now) if args.now else datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=TZ)
-
-    d, err = None, None
-    try:
-        raw = json.loads(Path(args.fixture).read_text(encoding="utf-8")) if args.fixture else \
-            LuxPortal(LUX_BASE, LUX_ACCOUNT, LUX_PASSWORD, LUX_SERIAL).fetch()
-        d = parse(raw)
-    except Exception as e:  # noqa: BLE001
-        err = f"{type(e).__name__}: {e}"
-        print(err, file=sys.stderr)
-
-    msgs = evaluate(d, st, now, err)
-    if args.status and d is not None and not any("Мониторинг инвертора запущен" in m for m in msgs):
-        msgs.append(status_text(d, st, now))
-
+    portal = None if args.fixture else LuxPortal(LUX_BASE, LUX_ACCOUNT, LUX_PASSWORD, LUX_SERIAL)
+    deadline = time.monotonic() + args.loop * 60
+    want_status = args.status
     failed = 0
-    for m in msgs:
-        if args.dry_run:
-            print("----\n" + m)
-            continue
-        try:
-            send_telegram(m)
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            print(e, file=sys.stderr)
 
-    # Состояние сохраняем в любом случае, иначе уже отправленные события повторятся.
-    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
-    if d is not None:
-        # vac/fac печатаем, чтобы по журналу проверить порог определения отключения
-        print(f"OK: grid={'on' if d['grid_on'] else 'off'} vac={d['grid_v']:.1f}V fac={d['grid_hz']:.2f}Hz "
-              f"soc={d['soc']}% eps={d['p_eps']}W data={d['data_time']} msgs={len(msgs)}")
+    while True:
+        now = datetime.fromisoformat(args.now) if args.now else datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=TZ)
+
+        d, err = None, None
+        try:
+            raw = json.loads(Path(args.fixture).read_text(encoding="utf-8")) if args.fixture else portal.fetch()
+            d = parse(raw)
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+            print(err, file=sys.stderr, flush=True)
+
+        msgs = evaluate(d, st, now, err)
+        if want_status and d is not None:
+            want_status = False  # статус по запросу — один раз за запуск
+            if not any("Мониторинг инвертора запущен" in m for m in msgs):
+                msgs.append(status_text(d, st, now))
+
+        for m in msgs:
+            if args.dry_run:
+                print("----\n" + m)
+                continue
+            try:
+                send_telegram(m)
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                print(e, file=sys.stderr, flush=True)
+
+        # Состояние сохраняем в любом случае, иначе уже отправленные события повторятся.
+        STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+        if d is not None:
+            # vac/fac печатаем, чтобы по журналу проверить порог определения отключения
+            print(f"OK: grid={'on' if d['grid_on'] else 'off'} vac={d['grid_v']:.1f}V fac={d['grid_hz']:.2f}Hz "
+                  f"soc={d['soc']}% eps={d['p_eps']}W data={d['data_time']} msgs={len(msgs)}", flush=True)
+
+        if time.monotonic() + args.interval > deadline:
+            break
+        time.sleep(args.interval)
+
+    if args.loop:
+        return 0  # в цикле сбой отправки не должен обрывать цепочку запусков
     return 1 if failed else 0
 
 
