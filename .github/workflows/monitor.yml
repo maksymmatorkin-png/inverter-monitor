@@ -1,0 +1,93 @@
+name: Мониторинг инвертора
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub запускает по расписанию с задержками, реальный шаг 5–15 минут
+  workflow_dispatch:
+    inputs:
+      send_status:
+        description: "Прислать в Telegram текущий статус"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # keepalive-коммит
+  actions: write    # удаление старых кэшей с состоянием
+
+# Запуски идут строго по очереди и не отменяют друг друга: состояние общее.
+concurrency:
+  group: inverter-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Установить зависимости
+        run: pip install --quiet -r requirements.txt
+
+      - name: Восстановить состояние
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: inverter-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            inverter-state-
+
+      - name: Проверить инвертор
+        env:
+          LUX_ACCOUNT: ${{ secrets.LUX_ACCOUNT }}
+          LUX_PASSWORD: ${{ secrets.LUX_PASSWORD }}
+          LUX_SERIAL: ${{ secrets.LUX_SERIAL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SITE_NAME: ${{ vars.SITE_NAME }}
+          SEND_STATUS: ${{ inputs.send_status }}
+        run: |
+          if [ "$SEND_STATUS" = "true" ]; then
+            python monitor.py --status
+          else
+            python monitor.py
+          fi
+
+      - name: Сохранить состояние
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: inverter-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Удалить старые кэши состояния
+        if: always()
+        continue-on-error: true
+        run: |
+          # оставляем два самых свежих
+          gh cache list --key inverter-state- --sort created_at --order desc --limit 100 \
+            --json id --jq '.[2:][].id' |
+          while read -r id; do
+            gh cache delete "$id" || true
+          done
+
+      - name: Keepalive
+        # GitHub отключает расписание в публичных репозиториях без активности 60 дней
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        run: |
+          days=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "Последний коммит: $days дн. назад"
+          if [ "$days" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: расписание остаётся активным"
+            git push
+          fi
