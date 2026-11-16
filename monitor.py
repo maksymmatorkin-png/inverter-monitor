@@ -495,9 +495,8 @@ def main() -> int:
         # Состояние сохраняем в любом случае, иначе уже отправленные события повторятся.
         STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
         if d is not None:
-            # vac/fac печатаем, чтобы по журналу проверить порог определения отключения
-            print(f"OK: grid={'on' if d['grid_on'] else 'off'} vac={d['grid_v']:.1f}V fac={d['grid_hz']:.2f}Hz "
-                  f"soc={d['soc']}% eps={d['p_eps']}W data={d['data_time']} msgs={len(msgs)}", flush=True)
+            # Показаний в журнале нет: в публичном репозитории его видят все.
+            print(f"OK: проверка выполнена, сообщений: {len(msgs)}", flush=True)
 
         if time.monotonic() + args.interval > deadline:
             break

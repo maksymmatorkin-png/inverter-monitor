@@ -78,7 +78,9 @@ class Home:
         env["PYTHONIOENCODING"] = "utf-8"
         p = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf-8")
         assert p.returncode == 0, f"код {p.returncode}\n{p.stdout}\n{p.stderr}"
-        self.checks = p.stdout.count("OK: grid=")
+        self.checks = p.stdout.count("OK: проверка выполнена")
+        for line in p.stdout.splitlines():  # показаний инвертора в строках журнала быть не должно
+            assert not line.startswith("OK:") or "=" not in line, f"показания попали в журнал: {line}"
         # отрезаем строки «OK: ...» после сообщений
         return [m.split("\nOK: ")[0].strip() for m in p.stdout.split("----\n")[1:]]
 
